@@ -1,14 +1,15 @@
 import copy
 import json
+import logging
 
 import httpx2
-from mcp.shared.exceptions import MCPError
 import pytest
-
 from conftest import SPEC, data, session_for
+from mcp.shared.exceptions import MCPError
+
 from litellm_admin_mcp.catalog import OPERATIONS
 from litellm_admin_mcp.config import Config
-from litellm_admin_mcp.gateway import Gateway, HELPERS
+from litellm_admin_mcp.gateway import HELPERS, Gateway
 from litellm_admin_mcp.schema import tool_schema
 from litellm_admin_mcp.server import create_http_app
 
@@ -24,6 +25,28 @@ async def test_real_mcp_create_key_and_read_back(stub):
         assert found["keys"][0]["key_alias"] == "engineering"
     assert len(stub.writes) == 1
     assert all(r.headers["Authorization"] == "Bearer alice-admin" for r in stub.requests)
+
+
+async def test_tools_list_logs_only_phase_timings_on_cache_miss_and_hit(stub, caplog):
+    caplog.set_level(logging.WARNING, logger="litellm_admin_mcp.gateway")
+    async with session_for(stub) as session:
+        for expected in (
+            [("authorization", "ok"), ("schema_lock_wait", "miss"),
+             ("openapi_fetch", "ok"), ("local_compilation", "ok")],
+            [("authorization", "ok"), ("schema_lock_wait", "hit")],
+        ):
+            caplog.clear()
+            assert (await session.list_tools()).tools
+            records = [
+                json.loads(record.getMessage()) for record in caplog.records
+                if record.name == "litellm_admin_mcp.gateway"
+            ]
+            assert [(record["stage"], record["status"]) for record in records] == expected
+            for record in records:
+                assert set(record) == {"stage", "status", "duration_ms"}
+                assert isinstance(record["duration_ms"], (int, float))
+                assert record["duration_ms"] >= 0
+    assert sum(request.url.path == "/openapi.json" for request in stub.requests) == 1
 
 
 async def test_real_mcp_add_model_verify_and_strip_provider_secrets(stub):

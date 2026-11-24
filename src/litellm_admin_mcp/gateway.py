@@ -1,9 +1,11 @@
 """Authenticated, non-retrying calls to a fixed LiteLLM management API."""
 import asyncio
-from dataclasses import dataclass
 import json
+import logging
 import re
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
@@ -13,9 +15,44 @@ from mcp import types
 
 from .catalog import BY_NAME, OPERATIONS
 from .config import Config
+from .results import (
+    MAX_RESULT_BYTES,
+    PAGE_BYTES,
+    READ_SCHEMA,
+    RESPONSE_SCHEMA,
+    ResultError,
+    ResultStore,
+    encode,
+    page,
+    select,
+)
 from .schema import SchemaError, discovery_schema, tool_schema
-from .results import (MAX_RESULT_BYTES, PAGE_BYTES, READ_SCHEMA, RESPONSE_SCHEMA,
-                      ResultError, ResultStore, encode, page, select)
+
+logger = logging.getLogger(__name__)
+
+
+def _log_phase(stage: str, status: str, duration_ms: float) -> None:
+    # The connector's launcher forwards warning-level diagnostics to stderr.
+    logger.warning(json.dumps({
+        "stage": stage, "status": status, "duration_ms": round(duration_ms, 3),
+    }))
+
+
+@contextmanager
+def _time_phase(stage: str, *, enabled: bool = True):
+    if not enabled:
+        yield
+        return
+    started = time.monotonic()
+    status = "error"
+    try:
+        yield
+        status = "ok"
+    except asyncio.CancelledError:
+        status = "cancelled"
+        raise
+    finally:
+        _log_phase(stage, status, (time.monotonic() - started) * 1000)
 
 
 DESCRIBE_SCHEMA = {
@@ -154,8 +191,9 @@ class Gateway:
         return Authorization(user["user_id"], frozenset(permissions["tools"]))
 
     async def tools(self, credential: str) -> dict[str, types.Tool]:
-        authorization = await self._authorization(credential)
-        canonical = await self._load_tools(credential)
+        with _time_phase("authorization"):
+            authorization = await self._authorization(credential)
+        canonical = await self._load_tools(credential, log_phases=True)
         visible = {}
         for name, tool in canonical.items():
             if name not in authorization.tools:
@@ -168,44 +206,63 @@ class Gateway:
                 annotations=types.ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
         return visible
 
-    async def _load_tools(self, credential: str) -> dict[str, types.Tool]:
-        async with self._schema_lock:
-            if self._tools is not None and time.monotonic() - self._loaded_at < 300:
+    async def _load_tools(self, credential: str, *, log_phases: bool = False) -> dict[str, types.Tool]:
+        started = time.monotonic()
+        try:
+            await self._schema_lock.acquire()
+        except asyncio.CancelledError:
+            if log_phases:
+                _log_phase("schema_lock_wait", "cancelled", (time.monotonic() - started) * 1000)
+            raise
+        try:
+            acquired = time.monotonic()
+            cached = self._tools is not None and acquired - self._loaded_at < 300
+            if log_phases:
+                _log_phase("schema_lock_wait", "hit" if cached else "miss", (acquired - started) * 1000)
+            if cached:
                 return self._tools
-            spec = await self._request("GET", "/openapi.json", credential, max_bytes=64_000_000)
-            if not isinstance(spec, dict) or not isinstance(spec.get("paths"), dict):
-                raise AdminError("Gateway OpenAPI schema is unavailable.", 503)
-            selected = {}
-            for item in OPERATIONS:
-                if self.config.allowed_tools and item.name not in self.config.allowed_tools:
-                    continue
-                if self.config.read_only and not item.read_only:
-                    continue
-                path = spec["paths"].get(item.path, {})
-                operation = path.get(item.method.lower())
-                if not operation:
-                    continue
-                if operation.get("operationId") != item.operation_id:
-                    raise AdminError(f"Gateway operation changed for {item.name}; update the connector before using it.", 503)
-                try:
-                    schema = tool_schema(spec, path, operation)
-                    schema["properties"]["response"] = RESPONSE_SCHEMA
-                    jsonschema.Draft202012Validator.check_schema(schema)
-                except (SchemaError, jsonschema.SchemaError, TypeError, KeyError):
-                    raise AdminError(f"Gateway schema is unsupported for {item.name}.", 503) from None
-                selected[item.name] = types.Tool(
-                    name=item.name, description=f"{item.summary}. {item.method} {item.path}. "
-                    + ("Read-only." if item.read_only else "Changes gateway state; execute only when requested. Never retry an uncertain write."),
-                    inputSchema=schema, annotations=types.ToolAnnotations(
-                        readOnlyHint=item.read_only, destructiveHint=not item.read_only,
-                        idempotentHint=item.read_only, openWorldHint=True,
-                    ),
-                )
-            if not selected:
-                raise AdminError("No compatible, enabled admin tools were found on this gateway.", 503)
+            with _time_phase("openapi_fetch", enabled=log_phases):
+                spec = await self._request("GET", "/openapi.json", credential, max_bytes=64_000_000)
+            with _time_phase("local_compilation", enabled=log_phases):
+                selected = self._compile_tools(spec)
             self._tools = selected
             self._loaded_at = time.monotonic()
             return selected
+        finally:
+            self._schema_lock.release()
+
+    def _compile_tools(self, spec: Any) -> dict[str, types.Tool]:
+        if not isinstance(spec, dict) or not isinstance(spec.get("paths"), dict):
+            raise AdminError("Gateway OpenAPI schema is unavailable.", 503)
+        selected = {}
+        for item in OPERATIONS:
+            if self.config.allowed_tools and item.name not in self.config.allowed_tools:
+                continue
+            if self.config.read_only and not item.read_only:
+                continue
+            path = spec["paths"].get(item.path, {})
+            operation = path.get(item.method.lower())
+            if not operation:
+                continue
+            if operation.get("operationId") != item.operation_id:
+                raise AdminError(f"Gateway operation changed for {item.name}; update the connector before using it.", 503)
+            try:
+                schema = tool_schema(spec, path, operation)
+                schema["properties"]["response"] = RESPONSE_SCHEMA
+                jsonschema.Draft202012Validator.check_schema(schema)
+            except (SchemaError, jsonschema.SchemaError, TypeError, KeyError):
+                raise AdminError(f"Gateway schema is unsupported for {item.name}.", 503) from None
+            selected[item.name] = types.Tool(
+                name=item.name, description=f"{item.summary}. {item.method} {item.path}. "
+                + ("Read-only." if item.read_only else "Changes gateway state; execute only when requested. Never retry an uncertain write."),
+                inputSchema=schema, annotations=types.ToolAnnotations(
+                    readOnlyHint=item.read_only, destructiveHint=not item.read_only,
+                    idempotentHint=item.read_only, openWorldHint=True,
+                ),
+            )
+        if not selected:
+            raise AdminError("No compatible, enabled admin tools were found on this gateway.", 503)
+        return selected
 
     async def call(self, name: str, arguments: dict, credential: str) -> Any:
         # No redundant call to tools(): execution and disclosure each have a
